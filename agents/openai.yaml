@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Image"
+  short_description: "在没有原生图片工具的会话里生成或编辑图片"
+  default_prompt: "使用 $codex-image 生成这张图，完成后打开图片逐条核对结果。"
