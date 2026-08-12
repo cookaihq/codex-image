@@ -125,26 +125,34 @@ describe("configuration layering", () => {
     await writeFileIn(workspace, ".env", `CODEX_IMAGE_MODEL=${MODEL}\n`);
     const nested = join(workspace.cwd, "nested");
     await mkdir(nested, { recursive: true });
-    await expectCode(["--prompt", "a cup"], "home_config_permission_required", {
+    await expectCode(["--prompt", "a cup"], "config_missing_model", {
       workspace,
       cwd: nested,
       env: { CODEX_IMAGE_BASE_URL: BASE, CODEX_IMAGE_API_KEY: KEY },
     });
   });
 
-  it("reads the home layer only when --use-local-key is given", async () => {
+  it("reads ~/.config/codex-image/.env automatically", async () => {
     const workspace = await makeWorkspace();
     await writeSkillHomeEnv(workspace, `CODEX_IMAGE_MODEL=${MODEL}\n`);
-    await expectCode(["--prompt", "a cup"], "home_config_permission_required", {
-      workspace,
-      env: { CODEX_IMAGE_BASE_URL: BASE, CODEX_IMAGE_API_KEY: KEY },
-    });
-    const payload = await expectOk(["--prompt", "a cup", "--use-local-key"], {
+    const payload = await expectOk(["--prompt", "a cup"], {
       workspace,
       env: { CODEX_IMAGE_BASE_URL: BASE, CODEX_IMAGE_API_KEY: KEY },
     });
     assert.equal(payload.model_source, "home_env");
     assert.equal(payload.requested_model, MODEL);
+  });
+
+  it("prefers a project file over the home layer", async () => {
+    const workspace = await makeWorkspace();
+    await writeSkillHomeEnv(workspace, "CODEX_IMAGE_MODEL=from-home\n");
+    await writeFileIn(workspace, ".env", "CODEX_IMAGE_MODEL=from-project\n");
+    const payload = await expectOk(["--prompt", "a cup"], {
+      workspace,
+      env: { CODEX_IMAGE_BASE_URL: BASE, CODEX_IMAGE_API_KEY: KEY },
+    });
+    assert.equal(payload.model_source, "project_env");
+    assert.equal(payload.requested_model, "from-project");
   });
 });
 
@@ -163,13 +171,11 @@ describe("Codex configuration fallback", () => {
     "",
   ].join("\n");
 
-  it("reads provider, model and base URL only when --use-codex-config is given", async () => {
+  it("reads provider, model and base URL from the Codex configuration automatically", async () => {
     const workspace = await makeWorkspace();
     await writeCodexHome(workspace, { configToml, authJson: { OPENAI_API_KEY: KEY } });
 
-    await expectCode(["--prompt", "a cup"], "home_config_permission_required", { workspace });
-
-    const payload = await expectOk(["--prompt", "a cup", "--use-codex-config"], { workspace });
+    const payload = await expectOk(["--prompt", "a cup"], { workspace });
     assert.equal(payload.endpoint, "https://gateway.example/v1/responses");
     assert.equal(payload.base_url_source, "codex_config");
     assert.equal(payload.api_key_source, "codex_auth");
@@ -188,7 +194,7 @@ describe("Codex configuration fallback", () => {
       ].join("\n"),
       authJson: { OPENAI_API_KEY: KEY },
     });
-    const payload = await expectOk(["--prompt", "a cup", "--use-codex-config"], { workspace });
+    const payload = await expectOk(["--prompt", "a cup"], { workspace });
     assert.equal(payload.requested_model, "gpt5");
     assert.equal(payload.endpoint, `${BASE}/responses`);
   });
@@ -208,7 +214,7 @@ describe("Codex configuration fallback", () => {
       ].join("\n"),
       authJson: { OPENAI_API_KEY: KEY },
     });
-    const payload = await expectOk(["--prompt", "a cup", "--use-codex-config"], { workspace });
+    const payload = await expectOk(["--prompt", "a cup"], { workspace });
     assert.equal(payload.requested_model, MODEL);
     assert.equal(payload.endpoint, `${BASE}/responses`);
   });
@@ -235,7 +241,7 @@ describe("Codex configuration fallback", () => {
       const workspace = await makeWorkspace();
       await writeCodexHome(workspace, { configToml: configText, authJson: { OPENAI_API_KEY: KEY } });
       const payload = await expectCode(
-        ["--prompt", "a cup", "--use-codex-config"],
+        ["--prompt", "a cup"],
         "config_invalid_codex_config",
         { workspace },
       );
@@ -246,9 +252,16 @@ describe("Codex configuration fallback", () => {
   it("refuses an auth file that is not JSON", async () => {
     const workspace = await makeWorkspace();
     await writeCodexHome(workspace, { configToml, authJson: "OPENAI_API_KEY=not-json" });
-    await expectCode(["--prompt", "a cup", "--use-codex-config"], "config_invalid_codex_auth", {
+    await expectCode(["--prompt", "a cup"], "config_invalid_codex_auth", {
       workspace,
     });
+  });
+
+  it("never opens the Codex layer when earlier layers are complete", async () => {
+    const workspace = await makeWorkspace();
+    await writeCodexHome(workspace, { configToml: "model = 42\n", authJson: "not-json" });
+    const payload = await expectOk(["--prompt", "a cup"], { workspace, env: fullEnv() });
+    assert.equal(payload.base_url_source, "environment");
   });
 
   it("reports a missing API key instead of converting another credential field", async () => {
@@ -258,7 +271,7 @@ describe("Codex configuration fallback", () => {
       authJson: { tokens: { access_token: "should-never-be-used" } },
     });
     const payload = await expectCode(
-      ["--prompt", "a cup", "--use-codex-config", "--use-local-key"],
+      ["--prompt", "a cup"],
       "config_missing_api_key",
       { workspace },
     );
@@ -329,36 +342,16 @@ describe("routing", () => {
     assert.equal(payload.max_attempts, 4);
   });
 
-  it("stops for authorisation instead of silently delegating", async () => {
-    const workspace = await makeWorkspace();
-    await installStubCodex(workspace, { login: "account" });
-    const payload = await expectCode(["--prompt", "a cup"], "home_config_permission_required", {
-      workspace,
-    });
-    assert.deepEqual(payload.guidance.missing_fields, [
-      "CODEX_IMAGE_BASE_URL",
-      "CODEX_IMAGE_API_KEY",
-      "CODEX_IMAGE_MODEL",
-    ]);
-    assert.equal(payload.guidance.delegate.available, true);
-    assert.equal(payload.guidance.delegate.login, "account");
-    assert.match(payload.error.message, /--use-codex-config/);
-    assert.match(payload.error.message, /--via codex-cli/);
-  });
-
-  it("reports the delegate state when no codex is installed", async () => {
-    const payload = await expectCode(["--prompt", "a cup"], "home_config_permission_required");
+  it("reports the delegate state when no codex is installed and nothing is configured", async () => {
+    const payload = await expectCode(["--prompt", "a cup"], "config_missing_base_url");
     assert.equal(payload.guidance.delegate.available, false);
     assert.equal(payload.guidance.delegate.code, "codex_cli_not_found");
   });
 
-  it("delegates once both home layers were considered and no key was found", async () => {
+  it("delegates automatically when no layer provides a key", async () => {
     const workspace = await makeWorkspace();
     await installStubCodex(workspace, { login: "account" });
-    const payload = await expectOk(
-      ["--prompt", "a cup", "--use-local-key", "--use-codex-config"],
-      { workspace },
-    );
+    const payload = await expectOk(["--prompt", "a cup"], { workspace });
     assert.equal(payload.route, "codex-cli");
     assert.equal(payload.codex_version, "0.146.0");
     assert.equal(payload.max_attempts, 1);

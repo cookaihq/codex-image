@@ -30,7 +30,6 @@ export const STABLE_ERROR_CODES = Object.freeze([
   "config_invalid_codex_auth",
   "config_invalid_base_url",
   "config_read_error",
-  "home_config_permission_required",
   "codex_cli_not_found",
   "codex_cli_version_unsupported",
   "codex_not_authenticated",
@@ -86,6 +85,7 @@ const BOOLEAN_FLAGS = new Set([
   "help",
   "preflight",
   "json",
+  // Accepted for backwards compatibility; the home layers are now always read.
   "use-local-key",
   "use-codex-config",
 ]);
@@ -297,8 +297,6 @@ export function resolveCommand(argv) {
       output: flags.get("output") ?? null,
       outputDir: flags.get("output-dir") ?? null,
       via,
-      useLocalKey: flags.get("use-local-key") === true,
-      useCodexConfig: flags.get("use-codex-config") === true,
     },
   };
 }
@@ -667,10 +665,13 @@ const SOURCE_NAMES = Object.freeze({
 });
 
 /**
- * Per-field first-found-wins resolution. Only layers the caller authorised for
- * this invocation are consulted.
+ * Per-field first-found-wins resolution across every layer: process environment,
+ * $PWD/.env.local, $PWD/.env, ~/.config/codex-image/.env, then the current Codex
+ * configuration. The Codex layer is only opened when an earlier layer left one of
+ * base URL, API key or model unresolved, so a complete configuration is never
+ * blocked by a malformed ~/.codex file.
  */
-export async function resolveConfiguration({ cwd, env, useLocalKey, useCodexConfig }) {
+export async function resolveConfiguration({ cwd, env }) {
   const layers = [];
 
   const fromEnvironment = new Map();
@@ -689,20 +690,12 @@ export async function resolveConfiguration({ cwd, env, useLocalKey, useCodexConf
     source: SOURCE_NAMES.projectEnv,
     values: await readEnvFileIfPresent(join(cwd, ".env")),
   });
+  layers.push({
+    source: SOURCE_NAMES.homeEnv,
+    values: await readEnvFileIfPresent(skillHomeConfigPath()),
+  });
 
-  if (useLocalKey) {
-    layers.push({
-      source: SOURCE_NAMES.homeEnv,
-      values: await readEnvFileIfPresent(skillHomeConfigPath()),
-    });
-  }
-
-  let codexLayer = null;
-  if (useCodexConfig) {
-    codexLayer = await readCodexConfigLayer(env);
-  }
-
-  const pick = (field) => {
+  const pickFromLayers = (field) => {
     const name = CONFIG_VARIABLES[field];
     for (const layer of layers) {
       const value = layer.values.get(name);
@@ -710,25 +703,31 @@ export async function resolveConfiguration({ cwd, env, useLocalKey, useCodexConf
         return { value: value.trim(), source: layer.source };
       }
     }
-    if (codexLayer !== null && field !== "outputDir") {
+    return { value: null, source: null };
+  };
+
+  const resolved = {
+    baseUrl: pickFromLayers("baseUrl"),
+    apiKey: pickFromLayers("apiKey"),
+    model: pickFromLayers("model"),
+    outputDir: pickFromLayers("outputDir"),
+  };
+
+  if (resolved.baseUrl.value === null || resolved.apiKey.value === null || resolved.model.value === null) {
+    const codexLayer = await readCodexConfigLayer(env);
+    for (const field of ["baseUrl", "apiKey", "model"]) {
+      if (resolved[field].value !== null) continue;
       const value = codexLayer[field];
       if (typeof value === "string" && value.trim() !== "") {
-        return {
+        resolved[field] = {
           value: value.trim(),
           source: field === "apiKey" ? SOURCE_NAMES.codexAuth : SOURCE_NAMES.codexConfig,
         };
       }
     }
-    return { value: null, source: null };
-  };
+  }
 
-  return {
-    baseUrl: pick("baseUrl"),
-    apiKey: pick("apiKey"),
-    model: pick("model"),
-    outputDir: pick("outputDir"),
-    homeAuthorised: { useLocalKey, useCodexConfig },
-  };
+  return resolved;
 }
 
 export function normalizeEndpoint(baseUrl, apiKeySource) {
@@ -883,7 +882,7 @@ function delegateErrorMessage(code, detection) {
       return (
         "The local Codex CLI is logged in with an API key rather than a ChatGPT account. " +
         "Delegation only serves account logins; use the HTTP route instead " +
-        "(--use-codex-config, or set CODEX_IMAGE_BASE_URL and CODEX_IMAGE_API_KEY)."
+        "(drop --via codex-cli — the Codex configuration's base URL and key are read automatically)."
       );
     default:
       return "The delegation route is unavailable.";
@@ -1100,43 +1099,33 @@ async function resolveOutputPlan({ request, configuration, cwd }) {
 // Preflight
 // ---------------------------------------------------------------------------
 
-function missingFieldNames(configuration) {
-  const missing = [];
-  if (configuration.baseUrl.value === null) missing.push(CONFIG_VARIABLES.baseUrl);
-  if (configuration.apiKey.value === null) missing.push(CONFIG_VARIABLES.apiKey);
-  if (configuration.model.value === null) missing.push(CONFIG_VARIABLES.model);
-  return missing;
-}
-
 function missingFieldError(configuration) {
   if (configuration.baseUrl.value === null) {
     return new CliError(
       "config_missing_base_url",
-      `No base URL was resolved. Set ${CONFIG_VARIABLES.baseUrl} or authorise a home configuration layer.`,
+      `No configuration layer (including ~/.config/codex-image/.env and the Codex CLI configuration) provided ${CONFIG_VARIABLES.baseUrl}.`,
     );
   }
   if (configuration.apiKey.value === null) {
     return new CliError(
       "config_missing_api_key",
-      `No API key was resolved. Set ${CONFIG_VARIABLES.apiKey}; other credential fields are never guessed or converted.`,
+      `No configuration layer provided ${CONFIG_VARIABLES.apiKey}; other credential fields are never guessed or converted.`,
     );
   }
   return new CliError(
     "config_missing_model",
-    `No top-level model was resolved. Set ${CONFIG_VARIABLES.model} or authorise a home configuration layer.`,
+    `No configuration layer (including ~/.config/codex-image/.env and the Codex CLI configuration) provided ${CONFIG_VARIABLES.model}.`,
   );
 }
 
 /**
- * Decides the route from the layers this invocation is allowed to read. It never
- * consults an unauthorised layer and never picks the delegation route silently
- * while a home layer could still supply a key.
+ * Decides the route after every configuration layer was consulted: a complete
+ * HTTP configuration wins; without an API key the run falls back to delegating
+ * to an account-authenticated local Codex CLI.
  */
 async function decideRoute({ request, configuration, env }) {
   const hasBaseUrl = configuration.baseUrl.value !== null;
   const hasApiKey = configuration.apiKey.value !== null;
-  const bothHomeLayersConsidered =
-    configuration.homeAuthorised.useLocalKey && configuration.homeAuthorised.useCodexConfig;
 
   if (request.via === "http") {
     if (!hasBaseUrl || !hasApiKey || configuration.model.value === null) {
@@ -1157,31 +1146,6 @@ async function decideRoute({ request, configuration, env }) {
 
   if (hasBaseUrl && hasApiKey && configuration.model.value !== null) {
     return { route: "http", reason: "a complete base URL and API key were resolved", detection: null };
-  }
-
-  if (!bothHomeLayersConsidered) {
-    const detection = await detectDelegatePrerequisites(env);
-    const missing = missingFieldNames(configuration);
-    throw new CliError(
-      "home_config_permission_required",
-      `The authorised configuration layers do not provide ${missing.join(", ")}. ` +
-        "Re-run with --use-codex-config (read the current Codex configuration) or --use-local-key " +
-        "(read ~/.config/codex-image/.env) to use the HTTP route, or with --via codex-cli to delegate " +
-        "to the local Codex CLI.",
-      {
-        missing_fields: missing,
-        home_options: [
-          { flag: "--use-codex-config", reads: "the current Codex configuration" },
-          { flag: "--use-local-key", reads: "~/.config/codex-image/.env" },
-        ],
-        delegate: {
-          available: detection.available,
-          code: detection.code,
-          version: detection.version,
-          login: detection.login,
-        },
-      },
-    );
   }
 
   if (!hasApiKey) {
@@ -1209,12 +1173,7 @@ async function decideRoute({ request, configuration, env }) {
  * dry-run reports is exactly what an execution would do.
  */
 async function buildPlan({ request, cwd, env }) {
-  const configuration = await resolveConfiguration({
-    cwd,
-    env,
-    useLocalKey: request.useLocalKey,
-    useCodexConfig: request.useCodexConfig,
-  });
+  const configuration = await resolveConfiguration({ cwd, env });
 
   const routing = await decideRoute({ request, configuration, env });
   const images = await loadImageInputs(request.images, cwd);
@@ -2197,16 +2156,16 @@ Options:
   --label <safe-label>     Filename label for generated output. Defaults to "image".
   --output <file>          Explicit output file. Fails if it already exists.
   --output-dir <directory> Output directory. Mutually exclusive with --output.
-  --use-local-key          Allow this process to read ~/.config/codex-image/.env.
-  --use-codex-config       Allow this process to read the current Codex configuration.
+  --use-local-key          Deprecated no-op; ~/.config/codex-image/.env is always read.
+  --use-codex-config       Deprecated no-op; the Codex configuration is always read.
   --via <route>            Force http or codex-cli instead of routing automatically.
   --preflight              Validate and report the plan, but stay offline.
   --json                   Emit exactly one JSON result on stdout; diagnostics go to stderr.
   -h, --help               Show this help.
 
 Configuration is read per field from, in order: process environment,
-$PWD/.env.local, $PWD/.env, then ~/.config/codex-image/.env (needs --use-local-key)
-and the current Codex configuration (needs --use-codex-config).
+$PWD/.env.local, $PWD/.env, ~/.config/codex-image/.env, then the current
+Codex configuration (~/.codex/config.toml and auth.json, read-only).
 Recognised variables: CODEX_IMAGE_BASE_URL, CODEX_IMAGE_API_KEY, CODEX_IMAGE_MODEL,
 CODEX_IMAGE_OUTPUT_DIR. An API key is never accepted as a command-line argument.
 `;
