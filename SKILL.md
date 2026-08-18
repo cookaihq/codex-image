@@ -1,6 +1,7 @@
 ---
 name: codex-image
-description: Use in Codex or Claude Code when the user asks to generate or edit an image and no native image tool is available in the current session — phrases like "生成图片"、"文生图"、"参考这张图生成"、"只把背景改成…"、"用 Responses API 生成图片"、"自定义 Base URL 生图". Sends one Responses API request with the server-side image_generation tool using your own Base URL and key, or delegates to a locally installed, account-authenticated Codex CLI when no key is configured. Do NOT use when the current Codex session already exposes the native image_gen tool (call that directly), nor for video, OCR, or non-generative editing such as crop, compress or watermark.
+version: 3.1.0
+description: v3.1.0｜Use in Codex or Claude Code when the user asks to generate or edit an image and no native image tool is available in the current session — phrases like "生成图片"、"文生图"、"参考这张图生成"、"只把背景改成…"、"用 Responses API 生成图片"、"自定义 Base URL 生图". Sends one Responses API request with the server-side image_generation tool using your own Base URL and key, or delegates to a locally installed, account-authenticated Codex CLI when no key is configured. Do NOT use when the current Codex session already exposes the native image_gen tool (call that directly), nor for video, OCR, or non-generative editing such as crop, compress or watermark.
 ---
 
 # codex-image
