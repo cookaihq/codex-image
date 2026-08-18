@@ -7,6 +7,29 @@
  * Runtime requirements: Node.js 18+ standard library only.
  */
 
+// Runtime version floor, checked for real (ADR 0007 rule 2.2). `engines` in
+// package.json is only consulted by package managers at install time — node
+// itself never looks at it at runtime, so the declaration cannot replace this
+// check. Keep MIN_NODE_MAJOR in sync with package.json `engines.node`.
+//
+// Placement: this gate cannot run "before the imports" — ESM hoists every
+// `import` declaration and evaluates it before any module-body statement, so
+// the imports below are already resolved by the time this check executes. That
+// is fine here because all of them are `node:` builtins, resolvable on every
+// Node 13+ runtime; none can fail on an old-but-supported runtime and pre-empt
+// this message. What the check does guarantee is that it runs before any of
+// this file's own logic — it is the first statement in the module body, so a
+// too-old Node exits here with an actionable message instead of failing later
+// inside a syntax- or API-dependent code path.
+const MIN_NODE_MAJOR = 18;
+const nodeMajor = Number.parseInt(process.version.slice(1).split(".")[0], 10);
+if (!Number.isFinite(nodeMajor) || nodeMajor < MIN_NODE_MAJOR) {
+  console.error(
+    `codex-image: Node 版本过低（需 >= ${MIN_NODE_MAJOR}，当前 ${process.version}）。请执行：brew install node`,
+  );
+  process.exit(1);
+}
+
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, realpathSync } from "node:fs";
@@ -1652,6 +1675,23 @@ function attemptDelay(attempt) {
   return [1000, 2000, 4000][attempt - 1] ?? 4000;
 }
 
+/**
+ * Runs one HTTP attempt and classifies its outcome. The `retryable` flag it
+ * returns is a *request*, not a decision: runHttpAttempts additionally requires
+ * `elapsed <= FAST_FAILURE_MS` and `attempt < HTTP_MAX_ATTEMPTS`, and cancels
+ * the retry when a Retry-After header asks for longer than FAST_FAILURE_MS.
+ *
+ * Per stage, as implemented below:
+ * - Before any response headers — whole-budget timeout or abort: NOT retryable
+ *   (ambiguous, see the long comment in the catch block). Any other connection
+ *   error: retryable.
+ * - HTTP error status: retryable only for RETRYABLE_STATUSES (408/429/5xx).
+ * - While reading the response stream — empty body, or the stream ending before
+ *   an image arrived: retryable, even though the provider certainly received the
+ *   request. A provider error event, or an explicit completion carrying no
+ *   image: NOT retryable (the provider gave a definitive answer; resending it
+ *   would fail the same way and bill again).
+ */
 async function performHttpAttempt({ endpoint, apiKey, body, metadata }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("request timeout")), REQUEST_TIMEOUT_MS);
@@ -1671,6 +1711,27 @@ async function performHttpAttempt({ endpoint, apiKey, body, metadata }) {
       });
     } catch (error) {
       const timedOut = Date.now() - startedAt >= REQUEST_TIMEOUT_MS || controller.signal.aborted;
+      // Deliberate deviation from ADR 0006 rule 2 (which classifies timeouts as
+      // transient and therefore retryable), scoped to *this* branch: the whole
+      // 300s request budget elapsed (or the controller aborted) while no response
+      // headers ever arrived. Waiting out the full generation budget and getting
+      // nothing back leaves the outcome unknown (ambiguous): the provider may have
+      // generated — and billed — the image while the response never reached us.
+      // There is no idempotency key and no way to query the provider for the
+      // previous attempt's state, so ADR 0006 rule 4 ("no blind retry of
+      // non-idempotent writes with an ambiguous outcome") wins over rule 2 here.
+      // A connection error raised before that budget elapsed stays retryable.
+      //
+      // Scope note — this is NOT a blanket "the POST was sent, therefore stop"
+      // rule, and the rest of this function does not follow one. Once response
+      // headers have arrived, a failure while reading the SSE stream (empty body,
+      // or the stream ending before an image) is still reported as retryable
+      // below, even though that request was certainly received by the provider.
+      // The bound on the resulting double-billing exposure is not this flag but
+      // the FAST_FAILURE_MS gate in runHttpAttempts: whatever `retryable` says,
+      // an attempt that already ran longer than 45s is never retried. The full
+      // per-stage classification is listed on performHttpAttempt's own comment.
+      // The user-facing wording of this timeout rule is in SKILL.md, "CRITICAL".
       return {
         outcome: "failed",
         startedAt,

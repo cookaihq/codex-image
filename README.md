@@ -32,7 +32,7 @@ ln -s "$PWD/codex-image" ~/.claude/skills/codex-image
 ln -s "$PWD/codex-image" ~/.agents/skills/codex-image
 ```
 
-运行时只需要 Node.js 18+，没有 npm 或 Python 依赖。平台支持 macOS 与 Linux。
+运行时只需要 Node.js 18+；仓根的 `package.json` 只声明 `engines`，没有任何 npm 或 Python 依赖，无需 `npm install`。平台支持 macOS 与 Linux。
 
 ## 配置
 
