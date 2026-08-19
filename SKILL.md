@@ -1,7 +1,7 @@
 ---
 name: codex-image
-version: 3.1.1
-description: v3.1.1｜Use in Codex or Claude Code when the user asks to generate or edit an image and no native image tool is available in the current session — phrases like "生成图片"、"文生图"、"参考这张图生成"、"只把背景改成…"、"用 Responses API 生成图片"、"自定义 Base URL 生图". Sends one Responses API request with the server-side image_generation tool using your own Base URL and key, or delegates to a locally installed, account-authenticated Codex CLI when no key is configured. Do NOT use when the current Codex session already exposes the native image_gen tool (call that directly), nor for video, OCR, or non-generative editing such as crop, compress or watermark.
+version: 3.2.0
+description: v3.2.0｜Use in Codex or Claude Code when the user asks to generate or edit an image and no native image tool is available in the current session — phrases like "生成图片"、"文生图"、"参考这张图生成"、"只把背景改成…"、"用 Responses API 生成图片"、"自定义 Base URL 生图". Sends one Responses API request with the server-side image_generation tool using your own Base URL and key, or delegates to a locally installed, account-authenticated Codex CLI when no key is configured. Do NOT use when the current Codex session already exposes the native image_gen tool (call that directly), nor for video, OCR, or non-generative editing such as crop, compress or watermark.
 ---
 
 # codex-image
@@ -40,6 +40,22 @@ description: v3.1.1｜Use in Codex or Claude Code when the user asks to generate
 - **不回显 Key**：脚本只输出 Key 的 SHA-256 短指纹；你也不要在对话里复述完整 Key。
 - 请求次数是有上限的：`http` 路径单次运行最多 4 次请求（含自动重试），`codex-cli` 路径恰好 1 次 `codex exec`、不自动重试。脚本失败后重跑就是重新发起请求，会再次消耗额度。
 - **整段请求超时（`network_error`，300 秒预算耗尽）一律不自动重试**，这是对 ADR 0006 规则 2「超时算瞬时错误、应当重试」的**有意偏离**。理由：POST 发出后超时意味着这次计费生图的结果不明（ambiguous）——provider 可能已经出图并计费，只是响应没回到本机；本脚本既没有幂等键，也无法向 provider 查询上一次尝试的状态，因此按 ADR 0006 规则 4「非幂等写操作结果不明时禁止盲重试」处理，规则 4 优先于规则 2。超时预算耗尽之前的连接失败仍按瞬时错误重试（那种情况没有产生计费请求）。要不要再发一次由你和用户决定：重跑脚本即为新的一次计费请求。
+
+## 第 0 步：检查更新（每次运行都做）
+
+进入下面的正式流程之前，先运行 skill 目录下的：
+
+```bash
+scripts/check_update.sh
+```
+
+- 退出码 `0`：直接进入下一步，**不要**向用户复述脚本输出。
+- 退出码 `10`：把脚本打印的报告**原样转述给用户**，并询问是否现在拉取。
+  - 用户同意 → 运行 `scripts/check_update.sh --pull`，成功后按新版本继续；失败时把脚本给出的拒绝原因转述给用户，然后**按当前版本继续本次任务**，不要卡在更新上。
+  - 用户拒绝或不理会 → 按当前版本继续，本次任务内不再提更新。
+- 用户说「关掉自动检查更新」→ 往 `~/.config/codex-image/.env` 写 `AUTO_UPDATE_CHECK=0`（该文件已存在则只改 / 追加这一行，不动其他行）。
+
+**更新检查永远不是任务的阻塞项**：检查失败、拉取失败、用户不理会，一律落到「按当前版本继续干活」。
 
 ## Workflow
 
