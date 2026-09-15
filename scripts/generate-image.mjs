@@ -678,6 +678,7 @@ async function readCodexConfigLayer(env) {
 
 const SOURCE_NAMES = Object.freeze({
   environment: "environment",
+  projectSkillEnv: "project_skill_env",
   projectEnvLocal: "project_env_local",
   projectEnv: "project_env",
   homeEnv: "home_env",
@@ -689,7 +690,7 @@ const SOURCE_NAMES = Object.freeze({
 
 /**
  * Per-field first-found-wins resolution across every layer: process environment,
- * $PWD/.env.local, $PWD/.env, ~/.config/codex-image/.env, then the current Codex
+ * $PWD/.env.codex-image, $PWD/.env.local, $PWD/.env, ~/.config/codex-image/.env, then the current Codex
  * configuration. The Codex layer is only opened when an earlier layer left one of
  * base URL, API key or model unresolved, so a complete configuration is never
  * blocked by a malformed ~/.codex file.
@@ -705,6 +706,10 @@ export async function resolveConfiguration({ cwd, env }) {
     }
   }
   layers.push({ source: SOURCE_NAMES.environment, values: fromEnvironment });
+  layers.push({
+    source: SOURCE_NAMES.projectSkillEnv,
+    values: await readEnvFileIfPresent(join(cwd, ".env.codex-image")),
+  });
   layers.push({
     source: SOURCE_NAMES.projectEnvLocal,
     values: await readEnvFileIfPresent(join(cwd, ".env.local")),
@@ -2225,7 +2230,7 @@ Options:
   -h, --help               Show this help.
 
 Configuration is read per field from, in order: process environment,
-$PWD/.env.local, $PWD/.env, ~/.config/codex-image/.env, then the current
+$PWD/.env.codex-image, $PWD/.env.local, $PWD/.env, ~/.config/codex-image/.env, then the current
 Codex configuration (~/.codex/config.toml and auth.json, read-only).
 Recognised variables: CODEX_IMAGE_BASE_URL, CODEX_IMAGE_API_KEY, CODEX_IMAGE_MODEL,
 CODEX_IMAGE_OUTPUT_DIR. An API key is never accepted as a command-line argument.

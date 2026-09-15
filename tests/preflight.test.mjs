@@ -50,6 +50,26 @@ async function expectCode(args, code, options = {}) {
 after(cleanupWorkspaces);
 
 describe("configuration layering", () => {
+  it("uses only its own skill file between environment and shared project files", async () => {
+    const workspace = await makeWorkspace();
+    await writeFileIn(workspace, ".env.other-skill", "CODEX_IMAGE_MODEL=wrong-skill\n");
+    await writeFileIn(workspace, ".env.local", `CODEX_IMAGE_MODEL=shared\nCODEX_IMAGE_BASE_URL=${BASE}\n`);
+    await writeFileIn(workspace, ".env.codex-image", "CODEX_IMAGE_MODEL=skill\nCODEX_IMAGE_BASE_URL=\n");
+    const selected = await expectOk(["--prompt", "a cup"], {workspace, env: {CODEX_IMAGE_API_KEY: KEY}});
+    assert.equal(selected.requested_model, "skill");
+    assert.equal(selected.model_source, "project_skill_env");
+    assert.equal(selected.base_url_source, "project_env_local");
+    const overridden = await expectOk(["--prompt", "a cup"], {workspace, env: fullEnv()});
+    assert.equal(overridden.requested_model, MODEL);
+    await writeFileIn(workspace, ".env.codex-image", "CODEX_IMAGE_MODEL=\n");
+    const fallback = await expectOk(["--prompt", "a cup"], {workspace, env: {CODEX_IMAGE_API_KEY: KEY}});
+    assert.equal(fallback.requested_model, "shared");
+    const nested = join(workspace.cwd, "nested");
+    await mkdir(nested);
+    await expectCode(["--prompt", "a cup"], "config_missing_model", {
+      workspace, cwd: nested, env: {CODEX_IMAGE_BASE_URL: BASE, CODEX_IMAGE_API_KEY: KEY},
+    });
+  });
   it("reads every field from the process environment", async () => {
     const payload = await expectOk(["--prompt", "a cup"], { env: fullEnv() });
     assert.equal(payload.base_url_source, "environment");
