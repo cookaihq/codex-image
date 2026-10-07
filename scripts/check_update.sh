@@ -131,36 +131,64 @@ read_env_key() {
   printf '%s' "${out}"
 }
 
-# 从 stdin 的 SKILL.md 内容里取 frontmatter 的 version 字段；取不到返回 1。
+# Read the version mapping, with legacy top-level version support during migration.
+# Only the frontmatter is read. Duplicate, missing, invalid or conflicting values
+# fail closed. The portable subset uses a block metadata mapping (two-space keys).
 parse_skill_version() {
-  local line in_fm=0 value="" got=0
-  while IFS= read -r line || [ -n "${line}" ]; do
-    line="${line%$'\r'}"
-    if [ "${in_fm}" -eq 0 ]; then
-      case "$(trim "${line}")" in
-        '---') in_fm=1; continue ;;
-        '') continue ;;
-        *) return 1 ;;
-      esac
-    fi
-    case "$(trim "${line}")" in
-      '---'|'...') break ;;
-    esac
-    case "${line}" in
-      version:*)
-        [ "${got}" -eq 1 ] && continue
-        value=$(trim "${line#version:}")
-        case "${value}" in
-          '"'*'"') value="${value#\"}"; value="${value%\"}" ;;
-          "'"*"'") value="${value#\'}"; value="${value%\'}" ;;
-        esac
-        got=1
-        ;;
-    esac
-  done
-  [ "${got}" -eq 1 ] && [ -n "${value}" ] || return 1
-  printf '%s' "${value}"
+  awk '
+    function scalar(s, q) {
+      sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s)
+      q = substr(s, 1, 1)
+      if (q == "\"" || q == sprintf("%c", 39)) {
+        s = substr(s, 2)
+        if (!index(s, q)) { bad=1; return "" }
+        tail = substr(s, index(s, q)+1)
+        if (tail !~ /^[ \t]*(#.*)?$/) bad=1
+        s = substr(s, 1, index(s, q)-1)
+      } else {
+        sub(/[ \t]+#.*/, "", s); sub(/[ \t]+$/, "", s)
+      }
+      return s
+    }
+    function semver(s, pre, n, i, parts) {
+      if (s !~ /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/) return 0
+      pre=s; sub(/\+.*/, "", pre)
+      if (index(pre, "-")) {
+        sub(/^[^-]*-/, "", pre); n=split(pre, parts, ".")
+        for (i=1; i<=n; i++) if (parts[i] ~ /^0[0-9]+$/) return 0
+      }
+      return 1
+    }
+    { sub(/\r$/, "") }
+    NR==1 { if ($0 != "---") bad=1; next }
+    /^---[ \t]*$|^\.\.\.[ \t]*$/ { closed=1; exit }
+    /^metadata:/ {
+      if (++maps > 1 || $0 !~ /^metadata:[ \t]*(#.*)?$/) bad=1
+      in_metadata=1; next
+    }
+    /^[^ \t#]/ { in_metadata=0 }
+    /^version:/ { if (++old_count > 1) bad=1; old=scalar(substr($0,9)); next }
+    in_metadata && /^  version:/ {
+      if (++new_count > 1) bad=1
+      new=scalar(substr($0,11)); next
+    }
+    END {
+      if (!closed || bad || (!old_count && !new_count) ||
+          (old_count && !semver(old)) || (new_count && !semver(new)) ||
+          (old_count && new_count && old != new)) exit 1
+      print new_count ? new : old
+    }
+  '
 }
+
+# Read-only metadata entry for release tools and contract tests; no config/Git I/O.
+if [ "${1:-}" = "--read-version" ]; then
+  if [ "$#" -ne 2 ] || [ ! -f "$2" ] || ! parse_skill_version < "$2"; then
+    printf '[skill-update-check] invalid-metadata: %s\n' "${2:-SKILL.md}" >&2
+    exit 1
+  fi
+  exit 0
+fi
 
 # 单次 fetch + 硬超时。bash 3.2 没有 GNU timeout，用「后台进程 + watchdog kill」：
 #   1. 子 shell 里 `exec` 掉自己，使后台 pid 就是 git 本身（否则 kill 只杀 subshell，
@@ -289,12 +317,7 @@ do_check() {
     printf '[%s] 更新检查未完成（无法比对 origin/main）\n' "${NAME}"
     return 0
   fi
-  if [ "${behind}" -eq 0 ]; then
-    printf '[%s] 已是最新\n' "${NAME}"
-    return 0
-  fi
-
-  # 6) 版本对比（任一侧解析失败则跳过版本子句，只报提交）
+  # 6) 版本对比；格式错误必须可见，但仍不阻塞业务。
   if [ -n "${prefix}" ]; then
     skill_md_rel="${prefix}/SKILL.md"
   else
@@ -313,6 +336,14 @@ do_check() {
     else
       version_clause="，版本 v${local_ver} → v${remote_ver}"
     fi
+  else
+    printf '[%s] invalid-metadata：本地或远端 Skill 版本缺失、非法或冲突；本次不建议拉取，按当前版本继续\n' "${NAME}"
+    return 0
+  fi
+
+  if [ "${behind}" -eq 0 ]; then
+    printf '[%s] 已是最新（版本 v%s）\n' "${NAME}" "${local_ver}"
+    return 0
   fi
 
   # 7) 提交摘要按路径分两段
@@ -368,7 +399,7 @@ do_check() {
 # ---------------------------------------------------------------- 拉取模式
 
 do_pull() {
-  local root branch dirty ok=1 new_ver head_line
+  local root branch dirty ok=1 new_ver head_line prefix skill_md_rel
 
   root=$(repo_root)
   if [ -z "${root}" ]; then
@@ -409,6 +440,14 @@ do_pull() {
 
   if [ "${ok}" -ne 1 ]; then
     printf '[%s] 未做任何改动。请自行处理上述问题后重试（本脚本不会 commit / reset / checkout）。\n' "${NAME}"
+    return 1
+  fi
+
+  prefix=$(skill_prefix) || return 1
+  skill_md_rel="${prefix:+${prefix}/}SKILL.md"
+  if ! parse_skill_version < "${SKILL_DIR}/SKILL.md" >/dev/null ||
+     ! git -C "${root}" show "origin/main:${skill_md_rel}" | parse_skill_version >/dev/null; then
+    printf '[%s] invalid-metadata：拒绝拉取版本缺失、非法或冲突的 Skill\n' "${NAME}"
     return 1
   fi
 
