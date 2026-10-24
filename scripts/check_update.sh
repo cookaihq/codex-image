@@ -1,7 +1,7 @@
 #!/bin/bash
 # check_update.sh — skill 自动检查更新（规范脚本 / canonical source）
 #
-# 规范来源：awesome-skills 外层仓 harness/skill-update-check/check_update.sh
+# 规范来源：skill-dev 外层仓 harness/skill-update-check/check_update.sh
 # 约定文档：docs/adr/0010-skill-auto-update-check.md
 #
 # 本文件是唯一源。各 skill 把它**原样复制**为 <skill>/scripts/check_update.sh
