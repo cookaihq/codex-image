@@ -16,7 +16,7 @@ Claude Code 里则根本没有原生图片工具。而 ChatGPT 订阅用户通�
 
 | 路径 | 触发条件 | 计费 | 上限 |
 |---|---|---|---|
-| `http` | 解析出完整 Base URL + API Key | 你自己的 API 账单 | 单次运行最多 4 次请求（自动重试） |
+| `http` | 解析出完整 Base URL + API Key | 你自己的 API 账单 | 默认 5 次请求重试，另有 5 次原响应流恢复 |
 | `codex-cli` | 无可用 Key，且本机 Codex CLI 为账号登录 | ChatGPT 订阅额度 | 单次运行 1 次 `codex exec`，600 秒 |
 
 两条都不可行时，Skill 会报告本机状态并引导配置，而不是丢一句"无法生成图片"。
@@ -32,7 +32,7 @@ ln -s "$PWD/codex-image" ~/.claude/skills/codex-image
 ln -s "$PWD/codex-image" ~/.agents/skills/codex-image
 ```
 
-运行时只需要 Node.js 18+；仓根的 `package.json` 只声明 `engines`，没有任何 npm 或 Python 依赖，无需 `npm install`。平台支持 macOS 与 Linux。
+运行时只需要 Node.js 18+；仓根的 `package.json` 只声明 `engines`，没有任何 npm 或 Python 依赖，无需 `npm install`。运行入口适配 Windows、macOS 和 Linux。
 
 ## 配置
 
@@ -46,6 +46,23 @@ export CODEX_IMAGE_OUTPUT_DIR="./codex-image/output"   # 可选
 每个字段独立按这个顺序取第一个非空值，六层全部自动读取：进程环境变量 → `$PWD/.env.codex-image` → `$PWD/.env.local` → `$PWD/.env` → `~/.config/codex-image/.env` → 当前 Codex 配置（读 `config.toml` 的 `base_url`/`model` 与 `auth.json` 的 `OPENAI_API_KEY`，只读）。
 
 前三个文件层只读脚本被调用时的工作目录，不向父目录递归。Codex 配置层只在前五层凑不齐 Base URL / Key / 模型时才打开。`--use-local-key` / `--use-codex-config` 已是兼容保留的 no-op。
+
+### 启动路径与连接恢复
+
+需要为当前项目调整时，可对 Agent 说：“请把 codex-image 的请求重试设为 2 次、响应流恢复设为 4 次，用项目级配置并读回生效来源。”上述配置层可以提供以下字段。Codex 自身配置层继续提供原有的连接字段。
+
+| 配置项 | 默认值 | 用途 |
+|---|---|---|
+| `CODEX_IMAGE_CODEX_EXECUTABLE` | 自动选择 | 依次采用显式路径、经过核验的当前 Codex 会话路径或 PATH 中的 `codex`。Windows 支持原生可执行文件和官方 npm 启动器。 |
+| `CODEX_IMAGE_REQUEST_MAX_RETRIES` | 5 | 第一次 HTTP 提交以外的安全重试次数，0–100。 |
+| `CODEX_IMAGE_STREAM_MAX_RETRIES` | 5 | HTTP 响应首次断流以后的恢复次数，0–100。 |
+| `CODEX_IMAGE_RETRY_BACKOFF_BASE_MS` | 1000 | 指数退避的起始等待，单位毫秒。 |
+| `CODEX_IMAGE_RETRY_BACKOFF_MAX_MS` | 16000 | 指数退避上限，单位毫秒。完整的服务冷却时间可以更长。 |
+| `CODEX_IMAGE_RESPONSES_BACKGROUND` | `false` | 服务支持 Responses 后台模式且允许留存响应时设为 `true`，启用 `background: true` 与 `store: true`。 |
+
+直连 HTTP 共享 300 秒总预算。断流后用已有响应 ID 和游标接续，服务无法检索原响应时停止。预检会报告所用入口和配置来源。
+
+ChatGPT 账号委托使用所选 Codex provider 的恢复策略。Codex 0.169.0 的内置 OpenAI provider 采用 4 次请求重试、5 次流重连。上表的次数、退避和后台响应设置在 HTTP 路径生效，账号委托的预检会标明策略由 Codex 管理。
 
 ## 直接用脚本
 
@@ -67,7 +84,7 @@ node scripts/generate-image.mjs --help
 - **API Key 永不作为命令行参数**，也不写进 stdout、stderr、JSON 或日志。只显示 SHA-256 前 12 位短指纹。
 - **绝不读取或转发账号登录的 OAuth token**。账号形态一律通过本机 Codex CLI 自己完成鉴权。
 - **失败不静默换路**：不会自动改用 Images API、换 provider、换模型、换 Key，也不会退回原生工具。
-- **重试范围窄且提前披露**：只有窄类别的快速失败（<45 秒且未收到图片）才自动重试，最多 4 次总请求，`response.failed` 和所有 4xx 一律不重试。
+- **请求重试以可重试证据为前提**。确认未发送的连接故障和明确的限流拒绝可以重试。已接受的请求通过原响应恢复。
 - **图片先验后落盘**：按 magic bytes 判定格式、读出真实宽高，写临时文件校验通过后才原子重命名，从不覆盖已有文件。
 
 ## 测试
@@ -77,6 +94,16 @@ node --test
 ```
 
 全部离线：provider 由本地 mock HTTP server 扮演，Codex CLI 由 PATH 上的桩程序扮演，配置读写在隔离的临时 HOME 里进行。测试从不访问真实 provider，也不产生任何费用。
+
+## 版本与 Release
+
+表格对应源码中的候选或已发布版本。Release 链接在发布后可用。
+
+<!-- release-table:begin -->
+| 目标 | 版本 | Release |
+|---|---|---|
+| codex-image | 3.4.0 | [v3.4.0](https://github.com/cookaihq/codex-image/releases/tag/v3.4.0) |
+<!-- release-table:end -->
 
 ## 许可
 

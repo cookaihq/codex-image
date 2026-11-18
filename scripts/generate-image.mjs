@@ -30,16 +30,13 @@ if (!Number.isFinite(nodeMajor) || nodeMajor < MIN_NODE_MAJOR) {
   process.exit(1);
 }
 
-import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, mkdir, open, readFile, rename, rm, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, extname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
+import { resolveCodexLaunch, runCodex } from "./codex-launch.mjs";
 
 /**
  * Stable error codes. Callers may branch on these strings; messages may change.
@@ -53,6 +50,7 @@ export const STABLE_ERROR_CODES = Object.freeze([
   "config_invalid_codex_auth",
   "config_invalid_base_url",
   "config_read_error",
+  "config_invalid_retry",
   "codex_cli_not_found",
   "codex_cli_version_unsupported",
   "codex_not_authenticated",
@@ -81,14 +79,20 @@ const CONFIG_VARIABLES = Object.freeze({
   apiKey: "CODEX_IMAGE_API_KEY",
   model: "CODEX_IMAGE_MODEL",
   outputDir: "CODEX_IMAGE_OUTPUT_DIR",
+  executable: "CODEX_IMAGE_CODEX_EXECUTABLE",
+  requestRetries: "CODEX_IMAGE_REQUEST_MAX_RETRIES",
+  streamRetries: "CODEX_IMAGE_STREAM_MAX_RETRIES",
+  backoffBaseMs: "CODEX_IMAGE_RETRY_BACKOFF_BASE_MS",
+  backoffMaxMs: "CODEX_IMAGE_RETRY_BACKOFF_MAX_MS",
+  responsesBackground: "CODEX_IMAGE_RESPONSES_BACKGROUND",
 });
 
 const RECOGNISED_ENV_KEYS = new Set(Object.values(CONFIG_VARIABLES));
 
-const HTTP_MAX_ATTEMPTS = 4;
+const DEFAULT_RETRIES = 5;
+const MAX_CONFIGURED_RETRIES = 100;
 const DELEGATE_MAX_CALLS = 1;
 const REQUEST_TIMEOUT_MS = 300_000;
-const FAST_FAILURE_MS = 45_000;
 const MINIMUM_CODEX_VERSION = "0.146.0";
 const CODEX_PROBE_TIMEOUT_MS = 10_000;
 
@@ -739,6 +743,12 @@ export async function resolveConfiguration({ cwd, env }) {
     apiKey: pickFromLayers("apiKey"),
     model: pickFromLayers("model"),
     outputDir: pickFromLayers("outputDir"),
+    executable: pickFromLayers("executable"),
+    requestRetries: pickFromLayers("requestRetries"),
+    streamRetries: pickFromLayers("streamRetries"),
+    backoffBaseMs: pickFromLayers("backoffBaseMs"),
+    backoffMaxMs: pickFromLayers("backoffMaxMs"),
+    responsesBackground: pickFromLayers("responsesBackground"),
   };
 
   if (resolved.baseUrl.value === null || resolved.apiKey.value === null || resolved.model.value === null) {
@@ -808,39 +818,24 @@ function compareVersions(left, right) {
   return 0;
 }
 
-async function findExecutable(name, env) {
-  const pathValue = env.PATH ?? "";
-  for (const directory of pathValue.split(":")) {
-    if (directory === "") {
-      continue;
-    }
-    const candidate = join(directory, name);
-    try {
-      await access(candidate, fsConstants.X_OK);
-      return candidate;
-    } catch {
-      // keep looking
-    }
-  }
-  return null;
-}
-
 /**
  * Detects whether the local Codex CLI can act as the delegate. Login shape is
  * read through the CLI's own status command; its raw output may contain
  * fragments of a key and is therefore never propagated.
  */
-export async function detectDelegatePrerequisites(env) {
-  const executable = await findExecutable("codex", env);
-  if (executable === null) {
-    return { available: false, code: "codex_cli_not_found", version: null, login: null };
+export async function detectDelegatePrerequisites(env, cwd = process.cwd(), explicit = null) {
+  const launch = await resolveCodexLaunch({ env, cwd, explicit });
+  if (launch === null) {
+    return { available: false, code: "codex_cli_not_found", version: null, login: null,
+      ...(explicit?.value ? { executable_source: explicit.source } : {}) };
   }
 
   let version = null;
   try {
-    const { stdout } = await execFileAsync(executable, ["--version"], {
+    const { stdout } = await runCodex(launch, ["--version"], {
       timeout: CODEX_PROBE_TIMEOUT_MS,
-      env,
+      env: delegateEnvironment(env),
+      cwd,
     });
     const match = /(\d+\.\d+\.\d+)/.exec(stdout);
     version = match?.[1] ?? null;
@@ -858,9 +853,10 @@ export async function detectDelegatePrerequisites(env) {
 
   let loginShape = "unknown";
   try {
-    const { stdout, stderr } = await execFileAsync(executable, ["login", "status"], {
+    const { stdout, stderr } = await runCodex(launch, ["login", "status"], {
       timeout: CODEX_PROBE_TIMEOUT_MS,
-      env,
+      env: delegateEnvironment(env),
+      cwd,
     });
     loginShape = classifyLoginOutput(`${stdout}${stderr}`, 0);
   } catch (error) {
@@ -880,7 +876,7 @@ export async function detectDelegatePrerequisites(env) {
   if (loginShape === "unknown") {
     return { available: false, code: "codex_not_authenticated", version, login: loginShape };
   }
-  return { available: true, code: null, version, login: loginShape, executable };
+  return { launch, available: true, code: null, version, login: loginShape };
 }
 
 /** Exit status decides logged-in vs logged-out; the text distinguishes the shape. */
@@ -1151,7 +1147,7 @@ function missingFieldError(configuration) {
  * HTTP configuration wins; without an API key the run falls back to delegating
  * to an account-authenticated local Codex CLI.
  */
-async function decideRoute({ request, configuration, env }) {
+async function decideRoute({ request, configuration, env, cwd }) {
   const hasBaseUrl = configuration.baseUrl.value !== null;
   const hasApiKey = configuration.apiKey.value !== null;
 
@@ -1163,7 +1159,7 @@ async function decideRoute({ request, configuration, env }) {
   }
 
   if (request.via === "codex-cli") {
-    const detection = await detectDelegatePrerequisites(env);
+    const detection = await detectDelegatePrerequisites(env, cwd, configuration.executable);
     if (!detection.available) {
       throw new CliError(detection.code, delegateErrorMessage(detection.code, detection), {
         delegate: detection,
@@ -1177,7 +1173,7 @@ async function decideRoute({ request, configuration, env }) {
   }
 
   if (!hasApiKey) {
-    const detection = await detectDelegatePrerequisites(env);
+    const detection = await detectDelegatePrerequisites(env, cwd, configuration.executable);
     if (detection.available) {
       return {
         route: "codex-cli",
@@ -1203,7 +1199,7 @@ async function decideRoute({ request, configuration, env }) {
 async function buildPlan({ request, cwd, env }) {
   const configuration = await resolveConfiguration({ cwd, env });
 
-  const routing = await decideRoute({ request, configuration, env });
+  const routing = await decideRoute({ request, configuration, env, cwd });
   const images = await loadImageInputs(request.images, cwd);
 
   if (routing.route === "codex-cli" && images.some((image) => image.kind === "remote")) {
@@ -1229,6 +1225,7 @@ async function buildPlan({ request, cwd, env }) {
   return {
     configuration,
     routing,
+    recovery: routing.route === "http" ? recoveryPolicy(configuration) : null,
     images,
     outputPlan,
     outputSource,
@@ -1252,11 +1249,12 @@ function buildSummary({ request, plan }) {
       outputPlan.kind === "file"
         ? { kind: "file", path: outputPlan.path, source: outputSource }
         : { ...outputPlan, source: outputSource },
-    max_attempts: routing.route === "http" ? HTTP_MAX_ATTEMPTS : DELEGATE_MAX_CALLS,
+    max_attempts: routing.route === "http" ? plan.recovery.requestRetries + 1 : DELEGATE_MAX_CALLS,
   };
 
   if (routing.route === "http") {
     summary.endpoint = endpoint;
+    summary.recovery = plan.recovery;
     summary.base_url_source = configuration.baseUrl.source;
     summary.api_key_source = configuration.apiKey.source;
     summary.api_key_fingerprint = `sha256:${keyDigest.slice(0, 12)}`;
@@ -1265,6 +1263,8 @@ function buildSummary({ request, plan }) {
     summary.model_source = configuration.model.source;
   } else {
     summary.codex_version = routing.detection.version;
+    summary.codex_executable_source = routing.detection.launch.source;
+    summary.recovery = { owner: "codex-cli", skill_overrides_supported: false };
     summary.delegate_login = routing.detection.login;
     summary.requested_model = null;
     summary.model_source = null;
@@ -1282,7 +1282,7 @@ async function runExecute({ request, cwd, env, io }) {
   const outcome =
     plan.routing.route === "http"
       ? await executeHttpRequest({ request, plan, io })
-      : await executeDelegatedRequest({ request, plan, env });
+      : await executeDelegatedRequest({ request, plan, env, io });
   return buildExecutionResult({ request, plan, outcome });
 }
 
@@ -1302,6 +1302,8 @@ function buildExecutionResult({ request, plan, outcome }) {
     requested_size: request.size,
     tool_settings: metadata.toolSettings,
     request_id: metadata.requestId,
+    ...(metadata.responseId ? { response_id: metadata.responseId } : {}),
+    ...(outcome.streamReconnects !== undefined ? { stream_reconnects: outcome.streamReconnects } : {}),
     attempts,
     image: {
       format: written.format,
@@ -1437,8 +1439,9 @@ function collectMetadata(event, metadata) {
     if (typeof response.model === "string") {
       metadata.responseModel = response.model;
     }
-    if (typeof response.id === "string") {
-      metadata.requestId = metadata.requestId ?? response.id;
+    if (typeof response.id === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(response.id)) {
+      metadata.responseId ??= response.id;
+      metadata.requestId ??= response.id;
     }
   }
 }
@@ -1479,10 +1482,19 @@ export async function readImageFromStream(body, metadata) {
     } catch {
       return null;
     }
+    if (metadata.responseId && typeof event?.response?.id === "string" && event.response.id !== metadata.responseId) {
+      failure = { code: "response_id_mismatch" };
+      return null;
+    }
     collectMetadata(event, metadata);
+    if (event?.type !== "keepalive" && Number.isSafeInteger(event?.sequence_number) && event.sequence_number >= 0) {
+      metadata.sequence = Math.max(metadata.sequence ?? 0, event.sequence_number);
+    }
+    if (event?.type === "response.completed") sawExplicitCompletion = true;
 
-    if (event?.type === "response.failed") {
-      failure = event.response?.error ?? { message: "The provider ended the response as failed." };
+    if (["response.failed", "response.incomplete", "error"].includes(event?.type)) {
+      failure = event.response?.error ?? event.error ?? event.response?.incomplete_details
+        ?? { message: "The provider ended the response as failed." };
       return null;
     }
 
@@ -1500,9 +1512,6 @@ export async function readImageFromStream(body, metadata) {
           metadataFromImageItem(image, metadata);
           return image.result;
         }
-      }
-      if (event?.type === "response.completed" && output.length > 0) {
-        sawExplicitCompletion = true;
       }
     }
     return null;
@@ -1534,7 +1543,7 @@ export async function readImageFromStream(body, metadata) {
       if (image !== null) {
         return { image, failure: null, sawExplicitCompletion };
       }
-      if (failure !== null) {
+      if (failure !== null || sawExplicitCompletion) {
         return { image: null, failure, sawExplicitCompletion };
       }
       newlineAt = buffered.indexOf("\n");
@@ -1571,7 +1580,7 @@ function parseRetryAfter(header) {
     return null;
   }
   const seconds = Number(header.trim());
-  if (Number.isFinite(seconds) && seconds >= 0) {
+  if (Number.isFinite(seconds) && seconds >= 0 && seconds <= 8e12) {
     return seconds * 1000;
   }
   const date = Date.parse(header);
@@ -1676,251 +1685,183 @@ async function writeImageOutput(buffer, outputPlan) {
 // Execution
 // ---------------------------------------------------------------------------
 
-function attemptDelay(attempt) {
-  return [1000, 2000, 4000][attempt - 1] ?? 4000;
+function recoveryPolicy(configuration) {
+  const sources = {};
+  const integer = (field, fallback, min, max) => {
+    const { value, source } = configuration[field];
+    sources[field] = source ?? "default";
+    if (value === null) return fallback;
+    const parsed = Number(value);
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+      throw new CliError("config_invalid_retry", `${CONFIG_VARIABLES[field]} must be an integer from ${min} to ${max}.`);
+    }
+    return parsed;
+  };
+  const requestRetries = integer("requestRetries", DEFAULT_RETRIES, 0, MAX_CONFIGURED_RETRIES);
+  const streamRetries = integer("streamRetries", DEFAULT_RETRIES, 0, MAX_CONFIGURED_RETRIES);
+  const backoffBaseMs = integer("backoffBaseMs", 1000, 1, 60_000);
+  const backoffMaxMs = integer("backoffMaxMs", 16_000, backoffBaseMs, 60_000);
+  if (backoffMaxMs < backoffBaseMs) {
+    throw new CliError("config_invalid_retry", "The retry backoff maximum must be at least the base delay.");
+  }
+  const resumable = configuration.responsesBackground;
+  if (resumable.value !== null && !/^(true|false)$/i.test(resumable.value)) {
+    throw new CliError("config_invalid_retry", `${CONFIG_VARIABLES.responsesBackground} must be true or false.`);
+  }
+  sources.responsesBackground = resumable.source ?? "default";
+  return { requestRetries, streamRetries, backoffBaseMs, backoffMaxMs,
+    responsesBackground: resumable.value?.toLowerCase() === "true", sources };
 }
 
-/**
- * Runs one HTTP attempt and classifies its outcome. The `retryable` flag it
- * returns is a *request*, not a decision: runHttpAttempts additionally requires
- * `elapsed <= FAST_FAILURE_MS` and `attempt < HTTP_MAX_ATTEMPTS`, and cancels
- * the retry when a Retry-After header asks for longer than FAST_FAILURE_MS.
- *
- * Per stage, as implemented below:
- * - Before any response headers — whole-budget timeout or abort: NOT retryable
- *   (ambiguous, see the long comment in the catch block). Any other connection
- *   error: retryable.
- * - HTTP error status: retryable only for RETRYABLE_STATUSES (408/429/5xx).
- * - While reading the response stream — empty body, or the stream ending before
- *   an image arrived: retryable, even though the provider certainly received the
- *   request. A provider error event, or an explicit completion carrying no
- *   image: NOT retryable (the provider gave a definitive answer; resending it
- *   would fail the same way and bill again).
- */
-async function performHttpAttempt({ endpoint, apiKey, body, metadata }) {
+const PRE_CONNECT_ERRORS = new Set(["EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT"]);
+const RATE_LIMIT_CODES = new Set(["rate_limit_exceeded", "rate_limit_error"]);
+const TRANSIENT_READ_ERRORS = new Set([...PRE_CONNECT_ERRORS, "ECONNRESET", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]);
+
+async function performHttpAttempt({ url, apiKey, body, metadata, deadline }) {
+  const reconnect = body === null;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error("request timeout")), REQUEST_TIMEOUT_MS);
-  const startedAt = Date.now();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, Math.ceil(deadline - performance.now())));
   try {
     let response;
     try {
-      response = await fetch(endpoint, {
-        method: "POST",
+      response = await fetch(url, {
+        method: reconnect ? "GET" : "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
+          ...(reconnect ? {} : { "Content-Type": "application/json" }),
           Accept: "text/event-stream",
         },
-        body: JSON.stringify(body),
+        ...(reconnect ? {} : { body: JSON.stringify(body) }),
+        redirect: "error",
         signal: controller.signal,
       });
     } catch (error) {
-      const timedOut = Date.now() - startedAt >= REQUEST_TIMEOUT_MS || controller.signal.aborted;
-      // Deliberate deviation from ADR 0006 rule 2 (which classifies timeouts as
-      // transient and therefore retryable), scoped to *this* branch: the whole
-      // 300s request budget elapsed (or the controller aborted) while no response
-      // headers ever arrived. Waiting out the full generation budget and getting
-      // nothing back leaves the outcome unknown (ambiguous): the provider may have
-      // generated — and billed — the image while the response never reached us.
-      // There is no idempotency key and no way to query the provider for the
-      // previous attempt's state, so ADR 0006 rule 4 ("no blind retry of
-      // non-idempotent writes with an ambiguous outcome") wins over rule 2 here.
-      // A connection error raised before that budget elapsed stays retryable.
-      //
-      // Scope note — this is NOT a blanket "the POST was sent, therefore stop"
-      // rule, and the rest of this function does not follow one. Once response
-      // headers have arrived, a failure while reading the SSE stream (empty body,
-      // or the stream ending before an image) is still reported as retryable
-      // below, even though that request was certainly received by the provider.
-      // The bound on the resulting double-billing exposure is not this flag but
-      // the FAST_FAILURE_MS gate in runHttpAttempts: whatever `retryable` says,
-      // an attempt that already ran longer than 45s is never retried. The full
-      // per-stage classification is listed on performHttpAttempt's own comment.
-      // The user-facing wording of this timeout rule is in SKILL.md, "CRITICAL".
+      const transportCode = error.cause?.code;
+      const retryable = (reconnect ? TRANSIENT_READ_ERRORS : PRE_CONNECT_ERRORS).has(transportCode);
       return {
-        outcome: "failed",
-        startedAt,
-        error: new CliError(
-          "network_error",
-          timedOut
-            ? "The request timed out before the provider responded."
-            : "The connection to the provider failed before any response headers arrived.",
-        ),
-        retryable: !timedOut,
+        error: new CliError("network_error", retryable
+          ? "The provider connection failed."
+          : "The provider did not respond. Check the request outcome before sending a new generation."),
+        retryable,
       };
     }
 
-    metadata.requestId =
-      metadata.requestId ??
-      response.headers.get("x-request-id") ??
-      response.headers.get("request-id") ??
-      null;
-    if (typeof response.headers.get("openai-model") === "string") {
-      metadata.responseModel = metadata.responseModel ?? response.headers.get("openai-model");
-    }
-
+    metadata.requestId ??= response.headers.get("x-request-id") ?? response.headers.get("request-id");
+    metadata.responseModel ??= response.headers.get("openai-model");
+    const retryAfterMs = parseRetryAfter(response.headers.get("retry-after"));
     if (!response.ok) {
       let payload = null;
       try {
-        const text = (await response.text()).slice(0, 64 * 1024);
-        payload = JSON.parse(text);
+        payload = JSON.parse((await response.text()).slice(0, 64 * 1024));
       } catch {
-        payload = null;
+        // The status is still useful when the body is unreadable.
       }
-      const details = payload === null ? { code: null, message: null, requestId: null } : sanitizeProviderError(payload);
-      metadata.requestId = metadata.requestId ?? details.requestId ?? null;
+      const details = sanitizeProviderError(payload);
+      metadata.requestId ??= details.requestId;
       const isAuth = response.status === 401 || response.status === 403;
-      const description = [
-        `The provider rejected the request with HTTP ${response.status}`,
-        details.code === null ? null : `code ${details.code}`,
-        details.message,
-      ]
-        .filter(Boolean)
-        .join(" — ");
-      return {
-        outcome: "failed",
-        startedAt,
-        error: new CliError(isAuth ? "auth_error" : "provider_error", `${description}.`),
-        retryable: RETRYABLE_STATUSES.has(response.status),
-        retryAfterMs: parseRetryAfter(response.headers.get("retry-after")),
-      };
+      const description = [`The provider returned HTTP ${response.status}`, details.code, details.message].filter(Boolean).join(" — ");
+      // A gateway 5xx or an unclassified 429 can follow a submitted generation.
+      // Replay POST only if the receiving service explicitly rejected it for rate limiting.
+      const retryable = reconnect ? RETRYABLE_STATUSES.has(response.status)
+        : response.status === 429 && RATE_LIMIT_CODES.has(details.code);
+      return { error: new CliError(isAuth ? "auth_error" : "provider_error", description + "."), retryable, retryAfterMs };
     }
 
-    if (response.body === null) {
-      return {
-        outcome: "failed",
-        startedAt,
-        error: new CliError("image_not_returned", "The provider returned an empty response stream."),
-        retryable: true,
-      };
+    if (reconnect && !response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) {
+      await response.body?.cancel();
+      return { error: new CliError("network_error", "The provider did not return a resumable stream for the existing response.") };
     }
-
     let stream;
     try {
-      stream = await readImageFromStream(response.body, metadata);
+      if (response.body !== null) stream = await readImageFromStream(response.body, metadata);
     } catch {
-      return {
-        outcome: "failed",
-        startedAt,
-        error: new CliError("network_error", "The response stream ended before an image arrived."),
-        retryable: true,
-      };
+      // Retain the response ID and cursor collected before the connection dropped.
     }
-
-    if (stream.image !== null) {
-      return { outcome: "image", startedAt, image: stream.image };
+    if (stream?.image != null) return { image: stream.image };
+    if (stream?.failure != null) {
+      const details = sanitizeProviderError(stream.failure);
+      metadata.requestId ??= details.requestId;
+      const description = ["The provider ended the response as failed", details.code, details.message].filter(Boolean).join(" — ");
+      return { error: new CliError("provider_error", description + ".") };
     }
-    if (stream.failure !== null) {
-      const details = sanitizeProviderError({ error: stream.failure });
-      metadata.requestId = metadata.requestId ?? details.requestId ?? null;
-      return {
-        outcome: "failed",
-        startedAt,
-        error: new CliError(
-          "provider_error",
-          `The provider ended the response as failed${details.code === null ? "" : ` (code ${details.code})`}${
-            details.message === null ? "" : `: ${details.message}`
-          }.`,
-        ),
-        retryable: false,
-      };
+    if (stream?.sawExplicitCompletion) {
+      return { error: new CliError("image_not_returned", "The model completed the response without returning an image.") };
     }
     return {
-      outcome: "failed",
-      startedAt,
-      error: new CliError(
-        "image_not_returned",
-        stream.sawExplicitCompletion
-          ? "The model completed the response without calling the image tool."
-          : "The response stream ended without an image and without a completion result.",
-      ),
-      retryable: !stream.sawExplicitCompletion,
+      error: new CliError("image_not_returned", "The response stream ended before an image arrived. Check the existing response before starting another generation."),
+      disconnected: true,
+      retryAfterMs,
     };
   } finally {
     clearTimeout(timer);
   }
 }
 
+function resumeUrl(endpoint, metadata) {
+  const url = new URL(endpoint);
+  url.pathname += "/" + metadata.responseId;
+  url.searchParams.set("stream", "true");
+  if (metadata.sequence !== null) url.searchParams.set("starting_after", String(metadata.sequence));
+  return url;
+}
+
 async function executeHttpRequest({ request, plan, io }) {
-  const { configuration, images, outputPlan, endpoint } = plan;
-  const body = buildRequestBody({
-    mode: request.mode,
-    prompt: request.prompt,
-    model: configuration.model.value,
-    images,
-    size: request.size,
-  });
-  const metadata = {
-    responseModel: null,
-    imageModel: null,
-    revisedPrompt: null,
-    toolSettings: null,
-    requestId: null,
-  };
+  const { configuration, images, outputPlan, endpoint, recovery } = plan;
+  const body = buildRequestBody({ mode: request.mode, prompt: request.prompt,
+    model: configuration.model.value, images, size: request.size });
+  if (recovery.responsesBackground) Object.assign(body, { background: true, store: true });
 
+  const metadata = { responseModel: null, imageModel: null, revisedPrompt: null, toolSettings: null,
+    requestId: null, responseId: null, sequence: null };
+  const deadline = performance.now() + REQUEST_TIMEOUT_MS;
   let attempts = 0;
-  let lastError = null;
+  let streamReconnects = 0;
+  let retryNotBefore = null;
 
-  /** Anything that fails once a POST has begun must be reported as such. */
-  const annotate = (error) => {
+  async function waitForRecovery(kind, number, result) {
+    const backoff = Math.min(recovery.backoffMaxMs, recovery.backoffBaseMs * 2 ** (number - 1));
+    const wait = Math.max(backoff, result.retryAfterMs ?? 0);
+    if (wait >= deadline - performance.now()) return false;
+    io.stderr(`codex-image: ${kind} ${number} in ${wait}ms (${result.error.code})\n`);
+    await new Promise((resolve) => setTimeout(resolve, wait));
+    return performance.now() < deadline;
+  }
+
+  try {
+    let result;
+    do {
+      metadata.requestId = null;
+      metadata.responseModel = null;
+      attempts += 1;
+      result = await performHttpAttempt({ url: endpoint, apiKey: configuration.apiKey.value, body, metadata, deadline });
+      retryNotBefore = result.retryAfterMs > 0 ? new Date(Date.now() + result.retryAfterMs).toISOString() : null;
+    } while (result.retryable && attempts <= recovery.requestRetries && await waitForRecovery("request retry", attempts, result));
+
+    if (result.disconnected && metadata.responseId !== null) {
+      while (streamReconnects < recovery.streamRetries && (result.disconnected || result.retryable)) {
+        if (!await waitForRecovery("stream reconnect", streamReconnects + 1, result)) break;
+        streamReconnects += 1;
+        result = await performHttpAttempt({ url: resumeUrl(endpoint, metadata), apiKey: configuration.apiKey.value,
+          body: null, metadata, deadline });
+        retryNotBefore = result.retryAfterMs > 0 ? new Date(Date.now() + result.retryAfterMs).toISOString() : null;
+      }
+    }
+    if (!result.image) throw result.error;
+    const buffer = Buffer.from(result.image, "base64");
+    if (buffer.byteLength === 0) throw new CliError("invalid_image_result", "The provider returned an unusable image payload.");
+    const written = await writeImageOutput(buffer, outputPlan);
+    return { written, metadata, attempts, streamReconnects };
+  } catch (error) {
     if (error instanceof CliError) {
       error.networkStarted = attempts > 0;
       error.attempts = attempts;
       error.requestId = metadata.requestId;
+      error.responseId = metadata.responseId;
+      error.streamReconnects = streamReconnects;
+      error.retryNotBefore = retryNotBefore;
     }
-    return error;
-  };
-
-  try {
-  for (let attempt = 1; attempt <= HTTP_MAX_ATTEMPTS; attempt += 1) {
-    attempts = attempt;
-
-    const result = await performHttpAttempt({
-      endpoint,
-      apiKey: configuration.apiKey.value,
-      body,
-      metadata,
-    });
-
-    if (result.outcome === "image") {
-      let buffer;
-      try {
-        buffer = Buffer.from(result.image, "base64");
-      } catch {
-        buffer = Buffer.alloc(0);
-      }
-      if (buffer.byteLength === 0) {
-        lastError = new CliError("invalid_image_result", "The provider returned an unusable image payload.");
-        break;
-      }
-      const written = await writeImageOutput(buffer, outputPlan);
-      return { written, metadata, attempts };
-    }
-
-    lastError = result.error;
-    const elapsed = Date.now() - result.startedAt;
-    const withinFastFailure = elapsed <= FAST_FAILURE_MS;
-    let retryable = result.retryable === true && withinFastFailure && attempt < HTTP_MAX_ATTEMPTS;
-
-    let wait = attemptDelay(attempt);
-    if (retryable && result.retryAfterMs !== null && result.retryAfterMs !== undefined) {
-      if (result.retryAfterMs > FAST_FAILURE_MS) {
-        retryable = false;
-      } else {
-        wait = result.retryAfterMs;
-      }
-    }
-    if (!retryable) {
-      break;
-    }
-    io.stderr(`codex-image: attempt ${attempt} failed (${lastError.code}); retrying in ${wait}ms\n`);
-    await new Promise((resolve) => setTimeout(resolve, wait));
+    throw error;
   }
-  } catch (error) {
-    throw annotate(error);
-  }
-
-  throw annotate(lastError);
 }
 
 // ---------------------------------------------------------------------------
@@ -1965,22 +1906,22 @@ function delegatePrompt({ mode, prompt, workDirectory, imageCount }) {
 }
 
 function delegateEnvironment(env) {
-  const allowed = ["PATH", "HOME", "CODEX_HOME", "TMPDIR", "LANG", "LC_ALL", "TERM", "USER"];
-  const forwarded = {};
-  for (const name of allowed) {
-    if (typeof env[name] === "string") {
-      forwarded[name] = env[name];
-    }
-  }
-  return forwarded;
+  const allowed = new Set(["PATH", "HOME", "CODEX_HOME", "TMPDIR", "LANG", "LC_ALL", "TERM", "USER",
+    "SYSTEMROOT", "WINDIR", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "PATHEXT"]);
+  return Object.fromEntries(Object.entries(env).filter(([name, value]) =>
+    allowed.has(process.platform === "win32" ? name.toUpperCase() : name) && typeof value === "string"));
 }
 
 function looksLikeAuthFailure(text) {
   return /not logged in|unauthor|authentication|401|token (has )?expired|please (re)?login/i.test(text);
 }
 
-async function executeDelegatedRequest({ request, plan, env }) {
-  const { images, outputPlan, routing } = plan;
+async function executeDelegatedRequest({ request, plan, env, io }) {
+  const { images, outputPlan, routing, configuration } = plan;
+  if (["requestRetries", "streamRetries", "backoffBaseMs", "backoffMaxMs", "responsesBackground"]
+    .some((field) => configuration[field].value !== null)) {
+    io.stderr("codex-image: the account-authenticated route uses the selected Codex provider's recovery policy. The Skill settings apply to HTTP.\n");
+  }
   if (images.some((image) => image.kind === "remote")) {
     throw new CliError(
       "codex_delegate_unsupported_input",
@@ -1994,7 +1935,7 @@ async function executeDelegatedRequest({ request, plan, env }) {
   const lastMessagePath = join(workDirectory, "final-message.json");
 
   try {
-    await mkdir(workDirectory, { recursive: true, mode: 0o700 });
+    await mkdir(workDirectory, { recursive: true });
     await writeFileAtomic(schemaPath, `${JSON.stringify(DELEGATE_OUTPUT_SCHEMA, null, 2)}\n`);
   } catch (error) {
     throw new CliError(
@@ -2032,7 +1973,7 @@ async function executeDelegatedRequest({ request, plan, env }) {
   let stderr = "";
   let failed = null;
   try {
-    const result = await execFileAsync("codex", args, {
+    const result = await runCodex(routing.detection.launch, args, {
       cwd: workDirectory,
       env: delegateEnvironment(env),
       timeout: DELEGATE_TIMEOUT_MS,
@@ -2141,12 +2082,16 @@ async function writeFileAtomic(path, contents) {
 // ---------------------------------------------------------------------------
 
 export function failureResult(code, message, options = {}) {
-  const { networkStarted = false, attempts = 0, requestId = null, details = null } = options;
+  const { networkStarted = false, attempts = 0, requestId = null, details = null,
+    responseId = null, streamReconnects, retryNotBefore = null } = options;
   const error = { code, message };
   if (requestId !== null) {
     error.request_id = requestId;
   }
+  if (responseId !== null) error.response_id = responseId;
+  if (retryNotBefore !== null) error.retry_not_before = retryNotBefore;
   const result = { ok: false, network_started: networkStarted, attempts, error };
+  if (streamReconnects !== undefined) result.stream_reconnects = streamReconnects;
   if (details !== null) {
     result.guidance = details;
   }
@@ -2232,8 +2177,9 @@ Options:
 Configuration is read per field from, in order: process environment,
 $PWD/.env.codex-image, $PWD/.env.local, $PWD/.env, ~/.config/codex-image/.env, then the current
 Codex configuration (~/.codex/config.toml and auth.json, read-only).
-Recognised variables: CODEX_IMAGE_BASE_URL, CODEX_IMAGE_API_KEY, CODEX_IMAGE_MODEL,
-CODEX_IMAGE_OUTPUT_DIR. An API key is never accepted as a command-line argument.
+Recognised variables:
+${Object.values(CONFIG_VARIABLES).join(", ")}.
+Supply the API key through configuration.
 `;
 
 const defaultIo = {
@@ -2294,6 +2240,9 @@ export async function run(argv, io = defaultIo, context = {}) {
           networkStarted: error.networkStarted === true,
           attempts: error.attempts ?? 0,
           requestId: error.requestId ?? null,
+          responseId: error.responseId ?? null,
+          streamReconnects: error.streamReconnects,
+          retryNotBefore: error.retryNotBefore ?? null,
         }),
         { json, io },
       );

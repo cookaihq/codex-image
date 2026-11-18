@@ -1,0 +1,2 @@
+/scripts/check_update.sh text eol=lf
+/scripts/check_update.ps1 text eol=lf

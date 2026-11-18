@@ -1,8 +1,8 @@
 ---
 name: codex-image
 metadata:
-  version: "3.3.0"
-description: v3.3.0｜Use in Codex or Claude Code when the user asks to generate or edit an image and no native image tool is available in the current session — phrases like "生成图片"、"文生图"、"参考这张图生成"、"只把背景改成…"、"用 Responses API 生成图片"、"自定义 Base URL 生图". Sends one Responses API request with the server-side image_generation tool using your own Base URL and key, or delegates to a locally installed, account-authenticated Codex CLI when no key is configured. Do NOT use when the current Codex session already exposes the native image_gen tool (call that directly), nor for video, OCR, or non-generative editing such as crop, compress or watermark.
+  version: "3.4.0"
+description: v3.4.0｜Use in Codex or Claude Code when the user asks to generate or edit an image and no native image tool is available in the current session — phrases like "生成图片"、"文生图"、"参考这张图生成"、"只把背景改成…"、"用 Responses API 生成图片"、"自定义 Base URL 生图". Sends one Responses API request with the server-side image_generation tool using your own Base URL and key, or delegates to a locally installed, account-authenticated Codex CLI when no key is configured. Do NOT use when the current Codex session already exposes the native image_gen tool (call that directly), nor for video, OCR, or non-generative editing such as crop, compress or watermark.
 ---
 
 # codex-image
@@ -15,7 +15,7 @@ description: v3.3.0｜Use in Codex or Claude Code when the user asks to generate
 
 | 路径 | 何时使用 | 计费 |
 |---|---|---|
-| `http` | 解析出完整 Base URL + API Key | 你自己的 API 账单，单次运行最多 4 次请求（自动重试） |
+| `http` | 解析出完整 Base URL + API Key | 你自己的 API 账单，安全请求重试与现有响应流恢复分别计数 |
 | `codex-cli` | 没有可用 Key，且本机 Codex CLI 是**账号登录** | ChatGPT 订阅额度，单次运行 1 次 `codex exec` |
 
 ## When to Use
@@ -39,8 +39,9 @@ description: v3.3.0｜Use in Codex or Claude Code when the user asks to generate
 - **有 `--image` 时模式不能猜**：必须问清楚是 `reference`（当参考）还是 `edit`（改这张），脚本也会拒绝猜测。
 - **成功后必须真的打开图片检查**，不能因为文件写成功就宣称完成。
 - **不回显 Key**：脚本只输出 Key 的 SHA-256 短指纹；你也不要在对话里复述完整 Key。
-- 请求次数是有上限的：`http` 路径单次运行最多 4 次请求（含自动重试），`codex-cli` 路径恰好 1 次 `codex exec`、不自动重试。脚本失败后重跑就是重新发起请求，会再次消耗额度。
-- **整段请求超时（`network_error`，300 秒预算耗尽）一律不自动重试**，这是对 ADR 0006 规则 2「超时算瞬时错误、应当重试」的**有意偏离**。理由：POST 发出后超时意味着这次计费生图的结果不明（ambiguous）——provider 可能已经出图并计费，只是响应没回到本机；本脚本既没有幂等键，也无法向 provider 查询上一次尝试的状态，因此按 ADR 0006 规则 4「非幂等写操作结果不明时禁止盲重试」处理，规则 4 优先于规则 2。超时预算耗尽之前的连接失败仍按瞬时错误重试（那种情况没有产生计费请求）。要不要再发一次由你和用户决定：重跑脚本即为新的一次计费请求。
+- HTTP 路径的请求重试和响应流恢复默认各 5 次。请求重试适用于确认尚未建立连接的故障或服务明确拒绝的限流请求。断流后按已有响应 ID 和游标接续。结果不明时报告 `response_id` / `request_id`、尝试次数和冷却时间。
+- 账号委托只运行一次 `codex exec`，连接恢复采用所选 Codex provider 的策略。设置 `CODEX_IMAGE_CODEX_EXECUTABLE` 指定可执行文件。省略时从有进程证据的当前 Codex 会话继承，否则从 PATH 解析 `codex`。
+- 用户要调整次数或退避时，读取 [README 配置](README.md#配置)。启用服务端后台响应会改变留存行为，按用户对所选服务的设置执行。
 
 ## 第 0 步：检查更新（每次运行都做）
 
@@ -145,4 +146,4 @@ CODEX_IMAGE_OUTPUT_DIR  # 默认 $PWD/codex-image/output/
 - 不承诺输出像素严格等于 `--size`
 - **绝不读取、复制或转发账号登录的 OAuth token**；账号形态一律通过本机 Codex CLI 委托
 - 委托路径不接受远程图片 URL，只接受本地文件
-- 平台限 macOS 与 Linux
+- 运行入口支持 Windows、macOS 与 Linux。Windows 委托支持原生 `codex.exe` 和官方 npm 启动器。

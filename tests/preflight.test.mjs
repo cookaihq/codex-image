@@ -359,7 +359,9 @@ describe("routing", () => {
     await installStubCodex(workspace, { login: "account" });
     const payload = await expectOk(["--prompt", "a cup"], { workspace, env: fullEnv() });
     assert.equal(payload.route, "http");
-    assert.equal(payload.max_attempts, 4);
+    assert.equal(payload.max_attempts, 6);
+    assert.equal(payload.recovery.requestRetries, 5);
+    assert.equal(payload.recovery.streamRetries, 5);
   });
 
   it("reports the delegate state when no codex is installed and nothing is configured", async () => {

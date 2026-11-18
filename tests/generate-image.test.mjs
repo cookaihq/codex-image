@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { readdir } from "node:fs/promises";
 import { after, describe, it } from "node:test";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { STABLE_ERROR_CODES } from "../scripts/generate-image.mjs";
@@ -239,7 +240,7 @@ describe("output discipline", () => {
 describe("module import", () => {
   it("does not run the CLI when imported", async () => {
     const workspace = await makeWorkspace();
-    const source = `import(${JSON.stringify(SCRIPT)}).then((m) => process.stdout.write(typeof m.run));`;
+    const source = `import(${JSON.stringify(pathToFileURL(SCRIPT).href)}).then((m) => process.stdout.write(typeof m.run));`;
     const { stdout, stderr } = await execFileAsync(
       process.execPath,
       ["--input-type=module", "-e", source],

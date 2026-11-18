@@ -18,7 +18,8 @@ const workspaces = [];
  */
 export async function makeWorkspace() {
   // Resolved through symlinks so expected paths match what the script sees as its cwd.
-  const root = await realpath(await mkdtemp(join(tmpdir(), "codex-image-")));
+  const parent = await realpath(process.env.CODEX_IMAGE_TEST_TMP ?? tmpdir());
+  const root = await realpath(await mkdtemp(join(parent, "codex-image-")));
   const workspace = {
     root,
     cwd: join(root, "project"),
@@ -42,6 +43,7 @@ export function envFor(workspace, overrides = {}) {
   return {
     PATH: workspace.bin,
     HOME: workspace.home,
+    ...(process.platform === "win32" ? { USERPROFILE: workspace.home, SystemRoot: process.env.SystemRoot } : {}),
     CODEX_HOME: join(workspace.home, ".codex"),
     ...overrides,
   };
@@ -70,82 +72,56 @@ export async function runCli(args, { workspace, env = {}, cwd } = {}) {
 export function soleJson(result) {
   const lines = result.stdout.trim().split("\n").filter(Boolean);
   if (lines.length !== 1) {
-    throw new Error(`expected exactly one JSON result, got ${lines.length}:\n${result.stdout}`);
+    throw new Error(`expected exactly one JSON result, got ${lines.length}:\n${result.stdout}
+${result.stderr}`);
   }
   return JSON.parse(lines[0]);
 }
 
-const LOGIN_BEHAVIOUR = {
-  account: 'echo "Logged in using ChatGPT account (tester@example.com)"; exit 0',
-  api_key: 'echo "Logged in using an API key - sk-abcd***wxyz"; exit 0',
-  logged_out: 'echo "Not logged in"; exit 1',
-  silent: "exit 0",
-};
-
-/**
- * Installs a fake codex on the workspace PATH. Every invocation is appended to
- * the workspace log so a test can assert how often, and with what, it was called.
- */
-/** Behaviours a delegated `codex exec` can exhibit, keyed by what the test needs to prove. */
-const EXEC_BEHAVIOUR = {
-  success: `/bin/cp "$FIXTURE" "$WORKDIR/generated.png"
-printf '{"image_path": "%s"}' "$WORKDIR/generated.png" > "$LAST"
-exit 0`,
-  success_with_model: `/bin/cp "$FIXTURE" "$WORKDIR/generated.png"
-printf '{"image_path": "%s", "image_model": "gpt-image-stub"}' "$WORKDIR/generated.png" > "$LAST"
-exit 0`,
-  relative_path: `/bin/cp "$FIXTURE" "$WORKDIR/generated.png"
-printf '{"image_path": "generated.png"}' > "$LAST"
-exit 0`,
-  no_structured_result: `/bin/cp "$FIXTURE" "$WORKDIR/generated.png"
-exit 0`,
-  missing_file: `printf '{"image_path": "%s"}' "$WORKDIR/absent.png" > "$LAST"
-exit 0`,
-  not_an_image: `printf 'this is not an image' > "$WORKDIR/generated.png"
-printf '{"image_path": "%s"}' "$WORKDIR/generated.png" > "$LAST"
-exit 0`,
-  auth_failure: `echo "Not logged in" >&2
-exit 1`,
-  crash: `echo "the session crashed" >&2
-exit 3`,
-  hang: `/bin/sleep 30
-exit 0`,
-};
-
+// Native Windows exercises the same official npm shim layout as a real installation.
 export async function installStubCodex(workspace, options = {}) {
   const { version = "0.146.0", login = "account", exec: execMode = "success" } = options;
   const fixturePath = join(workspace.root, "delegate-fixture.png");
   await writeFile(fixturePath, IMAGE_FIXTURES.png);
-
-  const script = `#!/bin/sh
-printf '%s\\n' "$*" >> ${JSON.stringify(workspace.codexLog)}
-FIXTURE=${JSON.stringify(fixturePath)}
-case "$1" in
-  --version) echo "codex-cli ${version}"; exit 0 ;;
-  login)
-    case "$2" in
-      status) ${LOGIN_BEHAVIOUR[login]} ;;
-    esac
-    exit 0 ;;
-  exec)
-    WORKDIR=""
-    LAST=""
-    prev=""
-    for arg in "$@"; do
-      case "$prev" in
-        -C|--cd) WORKDIR="$arg" ;;
-        -o|--output-last-message) LAST="$arg" ;;
-      esac
-      prev="$arg"
-    done
-    ${EXEC_BEHAVIOUR[execMode]}
-    ;;
-esac
-exit 0
-`;
-  const path = join(workspace.bin, "codex");
-  await writeFile(path, script, { mode: 0o755 });
-  return path;
+  const execute = async (args, options) => {
+    const { appendFile, copyFile, writeFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    await appendFile(options.log, args.join(" ") + "\n");
+    if (args[0] === "--version") return console.log("codex-cli " + options.version);
+    if (args[0] === "login") {
+      if (options.login === "account") console.log("Logged in using ChatGPT account (tester@example.com)");
+      if (options.login === "api_key") console.log("Logged in using an API key - sk-abcd***wxyz");
+      if (options.login === "logged_out") { console.log("Not logged in"); process.exitCode = 1; }
+      return;
+    }
+    if (args[0] !== "exec") return;
+    const dir = args[args.indexOf("-C") + 1];
+    const message = args[args.indexOf("--output-last-message") + 1];
+    const image = join(dir, "generated.png");
+    if (options.execMode === "auth_failure") { console.error("Not logged in"); process.exitCode = 1; return; }
+    if (options.execMode === "crash") { console.error("the session crashed"); process.exitCode = 3; return; }
+    if (options.execMode === "hang") { await new Promise(resolve => setTimeout(resolve, 30000)); return; }
+    if (options.execMode === "not_an_image") await writeFile(image, "this is not an image");
+    else if (options.execMode !== "missing_file") await copyFile(options.fixture, image);
+    if (options.execMode === "no_structured_result") return;
+    await writeFile(message, JSON.stringify({
+      image_path: options.execMode === "relative_path" ? "generated.png" : options.execMode === "missing_file" ? join(dir, "absent.png") : image,
+      ...(options.execMode === "success_with_model" ? { image_model: "gpt-image-stub" } : {}),
+    }));
+  };
+  const script = "(" + execute.toString() + ")(process.argv.slice(2), " +
+    JSON.stringify({ version, login, execMode, fixture: fixturePath, log: workspace.codexLog }) + ").catch(error => { console.error(error); process.exitCode = 1; });\n";
+  if (process.platform === "win32") {
+    const command = join(workspace.bin, "codex.cmd");
+    const directory = join(workspace.bin, "node_modules", "@openai", "codex", "bin");
+    await mkdir(directory, { recursive: true });
+    await writeFile(command, "@echo off\r\nexit /B 99\r\n");
+    await writeFile(join(directory, "codex.js"), script);
+    return command;
+  }
+  const command = join(workspace.bin, "codex");
+  await writeFile(command, "#!" + process.execPath + "\n" + script, { mode: 0o755 });
+  return command;
 }
 
 /** The full argv of each delegated call, so a test can inspect what was passed. */

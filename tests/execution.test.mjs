@@ -206,39 +206,79 @@ describe("streaming responses", () => {
 });
 
 describe("retry policy", () => {
-  it("retries a 500 and reports both attempts", async () => {
-    const { payload, server } = await runOnce(({ response, attempt }) => {
-      if (attempt === 1) {
-        response.writeHead(500, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: { code: "server_error", message: "try again" } }));
-        return;
-      }
-      respondWithImage()({ response });
+  const quick = { CODEX_IMAGE_RETRY_BACKOFF_BASE_MS: "1", CODEX_IMAGE_RETRY_BACKOFF_MAX_MS: "2" };
+  const stream = { ...quick, CODEX_IMAGE_RESPONSES_BACKGROUND: "true" };
+
+  function rateLimited(response, headers = {}) {
+    response.writeHead(429, { "content-type": "application/json", ...headers });
+    response.end(JSON.stringify({ error: { code: "rate_limit_exceeded" } }));
+  }
+
+  function interrupt(response, sequence = 2) {
+    startSse(response);
+    response.write(sse({ type: "response.created", sequence_number: sequence, response: { id: "resp_recoverable" } }));
+    response.end(sse({ type: "keepalive", sequence_number: 100 }));
+  }
+
+  it("makes one POST for an ambiguous 500", async () => {
+    const { payload, server } = await runOnce(({ response }) => {
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { code: "server_error" } }));
     });
-    assert.equal(payload.ok, true);
-    assert.equal(payload.attempts, 2);
-    assert.equal(server.requests.length, 2);
+    assert.equal(payload.error.code, "provider_error");
+    assert.equal(server.requests.length, 1);
   });
 
-  it("honours a short Retry-After and refuses a long one", async () => {
+  it("defaults to five request retries on explicit rate-limit rejection", async () => {
+    const result = await runOnce(({ response }) => rateLimited(response), undefined, { env: quick });
+    assert.equal(result.payload.attempts, 6);
+    assert.equal(result.payload.stream_reconnects, 0);
+    assert.equal(result.server.requests.length, 6);
+    assert.match(result.result.stderr, /request retry 1 in 1ms/);
+    assert.match(result.result.stderr, /request retry 5 in 2ms/);
+  });
+
+  it("uses the full Retry-After and reports a deadline outside the total budget", async () => {
     const short = await runOnce(({ response, attempt }) => {
-      if (attempt === 1) {
-        response.writeHead(429, { "retry-after": "1" });
-        response.end("{}");
-        return;
-      }
+      if (attempt === 1) return rateLimited(response, { "retry-after": "1" });
       respondWithImage()({ response });
-    });
+    }, undefined, { env: quick });
     assert.equal(short.payload.ok, true);
     assert.equal(short.payload.attempts, 2);
+    assert.match(short.result.stderr, /request retry 1 in 1000ms/);
 
-    const long = await runOnce(({ response }) => {
-      response.writeHead(429, { "retry-after": "120" });
-      response.end("{}");
-    });
-    assert.equal(long.payload.ok, false);
+    const long = await runOnce(({ response }) => rateLimited(response, { "retry-after": "1200" }), undefined, { env: quick });
     assert.equal(long.payload.error.code, "provider_error");
-    assert.equal(long.server.requests.length, 1, "a long Retry-After stops the retry sequence");
+    assert.ok(Date.parse(long.payload.error.retry_not_before) > Date.now());
+    assert.equal(long.server.requests.length, 1);
+  });
+
+  it("uses independent budgets and gets the same response by ID and cursor", async () => {
+    const value = await runOnce(({ response, request, attempt }) => {
+      if (attempt === 1) return rateLimited(response);
+      if (request.method === "POST" || attempt === 3) return interrupt(response);
+      startSse(response);
+      response.end(sse(imageItemEvent(PNG_BASE64)));
+    }, undefined, { env: { ...stream, CODEX_IMAGE_REQUEST_MAX_RETRIES: "1", CODEX_IMAGE_STREAM_MAX_RETRIES: "2" } });
+    assert.equal(value.payload.ok, true, value.result.stdout);
+    assert.equal(value.payload.attempts, 2);
+    assert.equal(value.payload.stream_reconnects, 2);
+    assert.deepEqual(value.server.requests.map(r => r.method), ["POST", "POST", "GET", "GET"]);
+    assert.equal(value.server.requests[1].body.background, true);
+    assert.equal(value.server.requests[1].body.store, true);
+    assert.ok(value.server.requests.slice(2).every(r => r.url === "/v1/responses/resp_recoverable?stream=true&starting_after=2" && r.body === null));
+  });
+
+  it("defaults to five stream reconnects and supports zero", async () => {
+    for (const settings of [stream, { ...stream, CODEX_IMAGE_STREAM_MAX_RETRIES: "0" }]) {
+      const value = await runOnce(({ response }) => interrupt(response), undefined, { env: settings });
+      const reconnects = "CODEX_IMAGE_STREAM_MAX_RETRIES" in settings ? 0 : 5;
+      assert.equal(value.payload.attempts, 1);
+      assert.equal(value.payload.stream_reconnects, reconnects);
+      assert.equal(value.payload.error.response_id, "resp_recoverable");
+      assert.equal(value.server.requests.filter(r => r.method === "POST").length, 1);
+      assert.equal(value.server.requests.filter(r => r.method === "GET").length, reconnects);
+    }
   });
 
   const terminal = {
@@ -285,14 +325,15 @@ describe("retry policy", () => {
     assert.equal(server.requests.length, 1);
   });
 
-  it("retries an empty stream up to the disclosed maximum", async () => {
+  it("keeps an empty stream at one generation request", async () => {
     const { payload, server } = await runOnce(({ response }) => {
       startSse(response);
       response.end();
     });
     assert.equal(payload.error.code, "image_not_returned");
-    assert.equal(server.requests.length, 4, "a single authorisation allows at most four requests");
-    assert.equal(payload.attempts, 4);
+    assert.equal(server.requests.length, 1);
+    assert.equal(payload.attempts, 1);
+    assert.equal(payload.stream_reconnects, 0);
   });
 
   it("stops immediately once an image was received", async () => {

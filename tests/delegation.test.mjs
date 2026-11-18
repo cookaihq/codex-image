@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { access, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import {
@@ -48,7 +48,7 @@ describe("delegated generation", () => {
     assert.equal(payload.attempts, 1);
     assert.equal(payload.image.format, "png");
     assert.equal(payload.image.width, 1);
-    assert.equal(payload.path, join(workspace.cwd, "codex-image", "output", payload.path.split("/").pop()));
+    assert.equal(payload.path, join(workspace.cwd, "codex-image", "output", basename(payload.path)));
     assert.deepEqual(payload.config_sources, {
       route: "codex-cli",
       codex_version: "0.146.0",
